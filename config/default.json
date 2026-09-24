@@ -1,0 +1,12 @@
+{
+  "log.level": "info",
+  "http.port": 8080,
+  "http.timeout_ms": 3000,
+  "sample.ratio": 0.5,
+  "feature.tls_enabled": true,
+  "service.name": "runtime-config-service",
+  "db.password": "change-me",
+  "flags": {
+    "new_checkout": { "rollout": 25 }
+  }
+}
