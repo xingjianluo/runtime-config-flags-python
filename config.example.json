@@ -1,0 +1,16 @@
+{
+  "values": {
+    "app_name": "shop-api",
+    "log_level": "info",
+    "max_connections": 200,
+    "sample_rate": 1.0,
+    "enable_cache": true,
+    "timeout_ms": 5000,
+    "db_password": "change-me-in-secret-management"
+  },
+  "flags": {
+    "new_checkout": { "mode": "percentage", "percentage": 20 },
+    "dark_mode": { "mode": "allow_groups", "groups": ["beta", "staff"] },
+    "legacy_reports": false
+  }
+}
