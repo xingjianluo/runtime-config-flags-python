@@ -14,7 +14,8 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+# -v 展示每个用例名（场景即函数名），-s 展示用例内“[场景] 输入 => [依据]”日志
+addopts = "-v -s"
 
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"

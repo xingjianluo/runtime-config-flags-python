@@ -119,18 +119,57 @@ def merge(
 
     同优先级按入参顺序后者覆盖前者；返回 (values, flags, origins, source_names)。
     """
+    result = merge_with_trace(layers)
+    origins = dict(result.value_origins)
+    origins.update(result.flag_origins)
+    return result.values, result.flags, origins, result.source_names
+
+
+@dataclass(frozen=True)
+class MergeResult:
+    """合并结果：获胜值 + 逐键来源溯源。
+
+    - value_origins/flag_origins: 键 -> 最终生效来源
+    - value_contributors/flag_contributors: 键 -> 提供过该键的来源序列
+      （按优先级从低到高），最后一个即获胜来源，其余为被盖掉的冲突方
+    """
+
+    values: dict[str, Any]
+    flags: dict[str, Any]
+    value_origins: dict[str, str]
+    flag_origins: dict[str, str]
+    value_contributors: dict[str, tuple[str, ...]]
+    flag_contributors: dict[str, tuple[str, ...]]
+    source_names: tuple[str, ...]
+
+
+def merge_with_trace(layers: list[Loaded]) -> MergeResult:
+    """按优先级稳定合并，并记录每个键的全部贡献来源。"""
     ordered = sorted(layers, key=lambda layer: layer.priority)
     values: dict[str, Any] = {}
     flags: dict[str, Any] = {}
-    origins: dict[str, str] = {}
+    value_origins: dict[str, str] = {}
+    flag_origins: dict[str, str] = {}
+    value_contributors: dict[str, list[str]] = {}
+    flag_contributors: dict[str, list[str]] = {}
     used: list[str] = []
     for layer in ordered:
         if layer.name not in used:
             used.append(layer.name)
         for key, val in layer.data.items():
             values[key] = val
-            origins[key] = layer.name
+            value_origins[key] = layer.name
+            value_contributors.setdefault(key, []).append(layer.name)
         for name, rule in layer.flags.items():
             flags[name] = rule
-            origins[name] = layer.name
-    return values, flags, origins, tuple(used)
+            flag_origins[name] = layer.name
+            flag_contributors.setdefault(name, []).append(layer.name)
+    return MergeResult(
+        values=values,
+        flags=flags,
+        value_origins=value_origins,
+        flag_origins=flag_origins,
+        value_contributors={k: tuple(v) for k, v in value_contributors.items()},
+        flag_contributors={k: tuple(v) for k, v in flag_contributors.items()},
+        source_names=tuple(used),
+    )

@@ -14,12 +14,15 @@ def test_failed_refresh_keeps_previous_snapshot(manager, valid_values):
         ]
     )
     assert result.ok is False
-    assert result.error_type == "ConfigRangeError"
-    assert result.reason and "max_connections" in result.reason
+    # 聚合错误，但每处问题的类别仍可区分
+    assert result.error_type == "ConfigValidationError"
+    issue = result.issues[0]
+    assert issue.kind == "range"
+    assert issue.key == "max_connections"
     # 旧版本原样保留
     assert manager.current() is old
     assert manager.current().values["max_connections"] == 100
-    print(f"[输入] max_connections=9999999 => [依据] 拒绝类型 {result.error_type}: {result.reason}")
+    print(f"[输入] max_connections=9999999 => [依据] 拒绝类别 {issue.kind}: {issue.message}")
 
 
 def test_type_error_refresh_rolls_back(manager, valid_values):
@@ -28,9 +31,10 @@ def test_type_error_refresh_rolls_back(manager, valid_values):
         [make_api_payload(values={**valid_values, "enable_cache": "no"})]
     )
     assert result.ok is False
-    assert result.error_type == "ConfigTypeError"
+    assert result.error_type == "ConfigValidationError"
+    assert result.issues[0].kind == "type"
     assert manager.current().version == old_version
-    print(f"[输入] enable_cache='no' => [依据] {result.error_type}: {result.reason}")
+    print(f"[输入] enable_cache='no' => [依据] {result.issues[0].message}")
 
 
 def test_format_error_refresh_rolls_back(manager):
@@ -38,7 +42,7 @@ def test_format_error_refresh_rolls_back(manager):
         [make_api_payload(values={"app_name": "Bad Name", "db_password": "s"})]
     )
     assert result.ok is False
-    assert result.error_type == "ConfigFormatError"
+    assert result.issues[0].kind == "format"
 
 
 def test_successful_refresh_switches_version(manager, valid_values):

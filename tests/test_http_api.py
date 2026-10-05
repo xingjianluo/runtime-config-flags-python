@@ -45,15 +45,22 @@ def test_bad_refresh_returns_distinct_error_and_keeps_version(client):
     assert resp.status_code == 422
     body = resp.json()
     assert body["error_type"] == "refresh_rejected"
-    assert body["detail_error_type"] == "ConfigRangeError"
+    assert body["detail_error_type"] == "ConfigValidationError"
+    # 多问题一次性上报，每处问题带 key/kind/source
+    issues = body["issues"]
+    issue = next(i for i in issues if i["key"] == "max_connections")
+    assert issue["kind"] == "range"
+    assert issue["source"] == "api"
     assert body["retained_version"] == before
-    print(f"[输入] max_connections=0 => [依据] {body['detail_error_type']}: {body['reason']}")
+    print(f"[输入] max_connections=0 => [依据] issues={issues}")
 
-    # 格式错误同样可区分
+    # 格式错误同样被聚合上报
     resp2 = client.post(
         "/refresh", json={"values": {"app_name": "bad name", "db_password": "x"}}
     )
-    assert resp2.json()["detail_error_type"] == "ConfigFormatError"
+    body2 = resp2.json()
+    assert body2["detail_error_type"] == "ConfigValidationError"
+    assert any(i["kind"] == "format" and i["key"] == "app_name" for i in body2["issues"])
     # 旧配置依旧在
     assert client.get("/config").json()["version"] == before
 
@@ -79,10 +86,16 @@ def test_flag_endpoint_explains_decision(client):
     assert unk.json()["error_type"] == "unknown_flag"
 
 
-def test_unknown_config_key_is_ignored_not_crashing(client):
-    # 未知配置字段不写入快照（多余字段宽容，非法已知字段严格拒绝）
+def test_unknown_config_key_is_rejected_not_silently_dropped(client):
+    # 新策略：规格之外的配置项不再宽容，整份提交被拒绝，问题逐项上报
     r = client.post(
         "/refresh", json={"values": {**VALID["values"], "totally_unknown": 1}}
     )
-    assert r.status_code == 200
+    assert r.status_code == 422
+    body = r.json()
+    issue = next(i for i in body["issues"] if i["key"] == "totally_unknown")
+    assert issue["kind"] == "unknown"
+    assert issue["source"] == "api"
+    # 整份拒绝，不留半成品
     assert "totally_unknown" not in client.get("/config").json()["values"]
+    print(f"[输入] 未定义键 totally_unknown => [依据] 整体拒绝: {issue['message']}")

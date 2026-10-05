@@ -17,6 +17,9 @@ from .errors import (
     ConfigRangeError,
     ConfigSourceError,
     ConfigTypeError,
+    ConfigUnavailableError,
+    ConfigValidationError,
+    ConfigUnknownKeyError,
 )
 from .flags import (
     Evaluation,
@@ -24,7 +27,7 @@ from .flags import (
     evaluate,
     request_scope,
 )
-from .manager import ConfigManager
+from .manager import ConfigManager, RefreshResult, VersionInfo
 from .schema import SENSITIVE_PLACEHOLDER, default_spec, redact
 from .sources import make_api_payload
 
@@ -39,8 +42,11 @@ _ERROR_STATUS = {
     ConfigMissingError: ("missing", 422),
     ConfigTypeError: ("type", 422),
     ConfigRangeError: ("range", 422),
+    ConfigUnknownKeyError: ("unknown", 422),
     ConfigFormatError: ("format", 422),
+    ConfigValidationError: ("validation", 422),
     ConfigSourceError: ("source", 400),
+    ConfigUnavailableError: ("unavailable", 503),
 }
 
 
@@ -57,8 +63,24 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="runtime-config-flags", lifespan=lifespan)
+
+
+def _history_limit_from_env() -> int:
+    raw = os.environ.get("CONFIG_HISTORY_LIMIT", "10")
+    try:
+        value = int(raw)
+        if value < 1:
+            raise ValueError
+    except ValueError:
+        logger.warning("CONFIG_HISTORY_LIMIT=%r 非法，回退为 10", raw)
+        return 10
+    return value
+
+
 app.state.manager = ConfigManager(
-    default_spec(), file_path=os.environ.get("CONFIG_FILE")
+    default_spec(),
+    file_path=os.environ.get("CONFIG_FILE"),
+    history_limit=_history_limit_from_env(),
 )
 
 
@@ -69,6 +91,8 @@ def get_manager(request: Request) -> ConfigManager:
 def _require_snapshot(manager: ConfigManager):
     try:
         return manager.current()
+    except ConfigUnavailableError as exc:
+        return _degraded_response(exc)
     except ConfigError:
         return JSONResponse(
             status_code=503,
@@ -80,8 +104,32 @@ def _require_snapshot(manager: ConfigManager):
         )
 
 
+def _degraded_response(exc: ConfigUnavailableError) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={
+            "ok": False,
+            "error_type": "unavailable",
+            "reason": exc.message,
+            "fault_source": exc.fault_source,
+            "fault_error_type": exc.fault_error_type,
+        },
+    )
+
+
 @app.exception_handler(ConfigError)
 async def config_error_handler(request: Request, exc: ConfigError):
+    if isinstance(exc, ConfigUnavailableError):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "error_type": "unavailable",
+                "reason": exc.message,
+                "fault_source": exc.fault_source,
+                "fault_error_type": exc.fault_error_type,
+            },
+        )
     for cls, (code, status) in _ERROR_STATUS.items():
         if isinstance(exc, cls):
             return JSONResponse(
@@ -119,12 +167,38 @@ class FlagCheckRequest(BaseModel):
 def health(manager: ConfigManager = Depends(get_manager)):
     try:
         snap = manager.current()
-        return {"ok": True, "version": snap.version}
+        return {"ok": True, "status": "ok", "version": snap.version}
+    except ConfigUnavailableError as exc:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "status": "degraded",
+                "error_type": "unavailable",
+                "fault_source": exc.fault_source,
+                "fault_error_type": exc.fault_error_type,
+                "reason": exc.message,
+            },
+        )
     except ConfigError:
         return JSONResponse(
             status_code=503,
-            content={"ok": False, "error_type": "uninitialized"},
+            content={"ok": False, "status": "uninitialized", "error_type": "uninitialized"},
         )
+
+
+def _shadows_view(snap) -> dict[str, list[dict[str, str]]]:
+    return {
+        key: [
+            {
+                "kind": shadow.kind,
+                "source": shadow.source,
+                "winning_source": shadow.winning_source,
+            }
+            for shadow in shadows
+        ]
+        for key, shadows in snap.shadows.items()
+    }
 
 
 @app.get("/config")
@@ -136,6 +210,10 @@ def get_config(manager: ConfigManager = Depends(get_manager)):
         "sources": list(snap.sources),
         "values": redact(snap, manager.spec),
         "field_origins": snap.field_origins,
+        "flag_origins": snap.flag_origins,
+        "shadows": _shadows_view(snap),
+        "created_at": snap.created_at,
+        "reason": snap.reason,
         "sensitive_placeholder": SENSITIVE_PLACEHOLDER,
     }
 
@@ -147,12 +225,24 @@ def refresh(
 ):
     """运行时刷新：文件+环境+本次推送（API 优先级最高）。
 
-    校验失败时返回 4xx 且服务仍保留上一份配置。
+    校验失败时返回 422 且服务仍保留上一份配置；来源故障进入降级态返回 503。
     """
     payload = payload or RefreshRequest()
-    result = manager.refresh(
+    result: RefreshResult = manager.refresh(
         make_api_payload(values=payload.values, flags=payload.flags)
     )
+    if result.degraded:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "error_type": "unavailable",
+                "detail_error_type": result.error_type,
+                "reason": result.reason,
+                "fault_source": result.fault_source,
+                "fault_error_type": result.error_type,
+            },
+        )
     if not result.ok:
         return JSONResponse(
             status_code=422,
@@ -162,11 +252,76 @@ def refresh(
                 "detail_error_type": result.error_type,
                 "reason": result.reason,
                 "retained_version": result.version,
+                "issues": [
+                    {
+                        "key": i.key,
+                        "kind": i.kind,
+                        "source": i.source,
+                        "message": i.message,
+                        "sensitive": i.sensitive,
+                    }
+                    for i in result.issues
+                ],
             },
         )
     return {
         "ok": True,
         "version": result.version,
+        "sources": list(result.sources),
+    }
+
+
+@app.get("/versions")
+def list_versions(manager: ConfigManager = Depends(get_manager)):
+    """列出最近若干份可用版本（最新在前），并标记当前正在使用的版本。"""
+    versions: list[VersionInfo] = manager.history()
+    return {
+        "history_limit": manager.history_limit,
+        "count": len(versions),
+        "versions": [
+            {
+                "version": v.version,
+                "sources": list(v.sources),
+                "created_at": v.created_at,
+                "reason": v.reason,
+                "origin_version": v.origin_version,
+                "current": v.current,
+            }
+            for v in versions
+        ],
+    }
+
+
+@app.post("/versions/{version}/rollback")
+def rollback_version(version: int, manager: ConfigManager = Depends(get_manager)):
+    """回退到历史中的指定版本；按普通刷新规则重新校验，失败则停留当前版本。"""
+    result = manager.rollback(version)
+    if not result.ok:
+        status = 404 if result.error_type == "VersionNotFound" else 422
+        return JSONResponse(
+            status_code=status,
+            content={
+                "ok": False,
+                "error_type": "rollback_rejected",
+                "detail_error_type": result.error_type,
+                "reason": result.reason,
+                "retained_version": result.version,
+                "issues": [
+                    {
+                        "key": i.key,
+                        "kind": i.kind,
+                        "source": i.source,
+                        "message": i.message,
+                        "sensitive": i.sensitive,
+                    }
+                    for i in result.issues
+                ],
+            },
+        )
+    return {
+        "ok": True,
+        "version": result.version,
+        "origin_version": version,
         "sources": list(result.sources),
     }
 

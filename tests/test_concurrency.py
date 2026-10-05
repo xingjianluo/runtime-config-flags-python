@@ -70,11 +70,8 @@ def test_concurrent_refresh_and_read_no_mixing(manager, spec):
                 r = manager.reload_from([make_api_payload(**bad)])
                 # 非法刷新必须失败，且旧快照仍然有效
                 assert not r.ok
-                assert r.error_type in {
-                    "ConfigRangeError",
-                    "ConfigTypeError",
-                    "ConfigMissingError",
-                }
+                kinds = {i.kind for i in r.issues}
+                assert kinds <= {"range", "type", "missing"}
                 snap = manager.current()
                 assert snap.values["app_name"] in {"alpha-app", "bravo-app", "my-app"}
         except Exception as exc:  # noqa: BLE001
