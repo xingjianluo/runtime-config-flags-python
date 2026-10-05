@@ -79,10 +79,19 @@ def test_flag_endpoint_explains_decision(client):
     assert unk.json()["error_type"] == "unknown_flag"
 
 
-def test_unknown_config_key_is_ignored_not_crashing(client):
-    # 未知配置字段不写入快照（多余字段宽容，非法已知字段严格拒绝）
+def test_unknown_config_key_is_rejected_with_diagnostic(client):
+    """未定义配置项不再静默忽略：整次提交拒绝，并指出问题项与来源。"""
+    before = client.get("/config").json().get("version")
     r = client.post(
         "/refresh", json={"values": {**VALID["values"], "totally_unknown": 1}}
     )
-    assert r.status_code == 200
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error_type"] == "refresh_rejected"
+    assert body["detail_error_type"] == "ConfigFormatError"
+    issue = next(i for i in body["issues"] if i["key"] == "totally_unknown")
+    assert issue["category"] == "unknown"
+    assert issue["source"] == "api"
     assert "totally_unknown" not in client.get("/config").json()["values"]
+    assert client.get("/config").json()["version"] == before
+    print(f"[输入] 未知键 totally_unknown => [依据] issues={body['issues']}")

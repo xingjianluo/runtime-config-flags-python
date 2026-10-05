@@ -17,6 +17,7 @@ from .errors import (
     ConfigRangeError,
     ConfigSourceError,
     ConfigTypeError,
+    ConfigUnavailableError,
 )
 from .flags import (
     Evaluation,
@@ -67,14 +68,29 @@ def get_manager(request: Request) -> ConfigManager:
 
 
 def _require_snapshot(manager: ConfigManager):
+    """读取当前快照；不可用时返回说明降级/未初始化的 503 响应。"""
     try:
         return manager.current()
+    except ConfigUnavailableError as exc:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "error_type": "config_unavailable",
+                "state": "degraded",
+                "reason": "配置来源故障，当前暂时没有可用配置",
+                "source": exc.source,
+                "kind": exc.kind,
+                "detail": exc.detail,
+            },
+        )
     except ConfigError:
         return JSONResponse(
             status_code=503,
             content={
                 "ok": False,
                 "error_type": "uninitialized",
+                "state": "uninitialized",
                 "reason": "当前没有任何可用配置，请先通过 POST /refresh 推送合法配置",
             },
         )
@@ -117,25 +133,48 @@ class FlagCheckRequest(BaseModel):
 
 @app.get("/health")
 def health(manager: ConfigManager = Depends(get_manager)):
-    try:
-        snap = manager.current()
-        return {"ok": True, "version": snap.version}
-    except ConfigError:
+    status = manager.status()
+    if status["state"] == "active":
+        return {"ok": True, **status}
+    if status["state"] == "degraded":
         return JSONResponse(
             status_code=503,
-            content={"ok": False, "error_type": "uninitialized"},
+            content={
+                "ok": False,
+                "error_type": "config_unavailable",
+                **status,
+            },
         )
+    return JSONResponse(
+        status_code=503,
+        content={"ok": False, "error_type": "uninitialized", **status},
+    )
 
 
 @app.get("/config")
 def get_config(manager: ConfigManager = Depends(get_manager)):
-    """返回脱敏配置、版本、来源与每个字段的出处（敏感值永不外泄）。"""
-    snap = manager.current()
+    """返回脱敏配置、版本、来源与每个字段的出处（敏感值永不外泄）。
+
+    另带 shadowed：本次生效版本提交时被高优先级来源挡下的低优先级合法取值。
+    """
+    snap_or_resp = _require_snapshot(manager)
+    if not hasattr(snap_or_resp, "version"):
+        return snap_or_resp
+    snap = snap_or_resp
     return {
         "version": snap.version,
         "sources": list(snap.sources),
         "values": redact(snap, manager.spec),
         "field_origins": snap.field_origins,
+        "shadowed": [
+            {
+                "key": s.key,
+                "source": s.source,
+                "winning_source": s.winning_source,
+                "section": s.section,
+            }
+            for s in manager.last_shadowed()
+        ],
         "sensitive_placeholder": SENSITIVE_PLACEHOLDER,
     }
 
@@ -147,12 +186,26 @@ def refresh(
 ):
     """运行时刷新：文件+环境+本次推送（API 优先级最高）。
 
-    校验失败时返回 4xx 且服务仍保留上一份配置。
+    - 语义校验失败：422，一次性给出所有问题（key/分类/来源），保留当前版本；
+    - 来源故障：503，进入降级态并说明来源与故障类别；
+    - 成功：200，返回版本、来源以及被挡下的低优先级冲突 shadowed。
     """
     payload = payload or RefreshRequest()
     result = manager.refresh(
         make_api_payload(values=payload.values, flags=payload.flags)
     )
+    if result.state == "degraded":
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "error_type": "config_unavailable",
+                "state": "degraded",
+                "detail_error_type": result.error_type,
+                "reason": result.reason,
+                "retained_version": result.version,
+            },
+        )
     if not result.ok:
         return JSONResponse(
             status_code=422,
@@ -162,18 +215,100 @@ def refresh(
                 "detail_error_type": result.error_type,
                 "reason": result.reason,
                 "retained_version": result.version,
+                "issues": [
+                    {
+                        "key": i.key,
+                        "category": i.category,
+                        "source": i.source,
+                        "section": i.section,
+                        "message": i.message,
+                    }
+                    for i in result.issues
+                ],
             },
         )
     return {
         "ok": True,
         "version": result.version,
         "sources": list(result.sources),
+        "rolled_back_from": result.rolled_back_from,
+        "shadowed": [
+            {
+                "key": s.key,
+                "source": s.source,
+                "winning_source": s.winning_source,
+                "section": s.section,
+            }
+            for s in result.shadowed
+        ],
+    }
+
+
+@app.get("/versions")
+def list_versions(manager: ConfigManager = Depends(get_manager)):
+    """历史版本清单：版本号、来源、切换时间、是否为回退产物。"""
+    return {
+        "current_version": (
+            manager.current().version if manager.state == "active" else None
+        ),
+        "state": manager.state,
+        "history_limit": manager.history_limit,
+        "versions": manager.history(),
+    }
+
+
+@app.post("/versions/{version}/rollback")
+def rollback_version(
+    version: int, manager: ConfigManager = Depends(get_manager)
+):
+    """一键回退：按与普通刷新相同的规则校验目标版本，失败则停在当前版本。"""
+    result = manager.rollback(version)
+    if result.state == "degraded" and not result.ok:
+        # 回退的层来自历史快照，理论上不含来源故障；保留防御性分支
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "error_type": "config_unavailable",
+                "state": "degraded",
+                "reason": result.reason,
+            },
+        )
+    if not result.ok:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "ok": False,
+                "error_type": "rollback_rejected",
+                "detail_error_type": result.error_type,
+                "reason": result.reason,
+                "retained_version": result.version,
+                "issues": [
+                    {
+                        "key": i.key,
+                        "category": i.category,
+                        "source": i.source,
+                        "section": i.section,
+                        "message": i.message,
+                    }
+                    for i in result.issues
+                ],
+            },
+        )
+    return {
+        "ok": True,
+        "version": result.version,
+        "rolled_back_from": result.rolled_back_from,
+        "sources": list(result.sources),
     }
 
 
 @app.get("/flags")
 def list_flags(manager: ConfigManager = Depends(get_manager)):
-    snap = manager.current()
+    snap_or_resp = _require_snapshot(manager)
+    if not hasattr(snap_or_resp, "version"):
+        return snap_or_resp
+    snap = snap_or_resp
     out = []
     for fspec in manager.spec.flags:
         rule = snap.flags[fspec.name]
@@ -198,7 +333,10 @@ def check_flag(
 ):
     """在请求级上下文中判定开关，多次判定结果一致，返回可解释依据。"""
     payload = payload or FlagCheckRequest()
-    snap = manager.current()
+    snap_or_resp = _require_snapshot(manager)
+    if not hasattr(snap_or_resp, "version"):
+        return snap_or_resp
+    snap = snap_or_resp
     with request_scope():
         result: Evaluation = evaluate(
             snap,
